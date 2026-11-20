@@ -33,6 +33,7 @@ from homeassistant.const import (
     UnitOfPower,
 )
 from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceEntryType
 
 try:
@@ -144,8 +145,19 @@ def _pretty(entity_id: str) -> str:
     return text[:1].upper() + text[1:]
 
 
-def _key_name(key: str) -> str:
-    base = _pretty(key)
+def _key_name(key: str, hass: HomeAssistant | None = None) -> str:
+    """Display name for a watched device, using its name in Home Assistant."""
+    eid = key.split("|")[0]
+    base = None
+    if hass is not None:
+        state = hass.states.get(eid)
+        if state is not None:
+            base = state.attributes.get("friendly_name")
+        if not base:
+            entry = er.async_get(hass).async_get(eid)
+            if entry is not None:
+                base = entry.name or entry.original_name
+    base = base or _pretty(key)
     if "|" in key:
         return f"{base} {key.split('|')[1]}"
     return base
@@ -581,10 +593,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         entities.append(EnergySensor(*ctx, label, name, _ICONS.get(label)))
     for eid in detective.devices:
         for key in device_keys(eid):
-            name = _key_name(key)
+            name = _key_name(key, hass)
             icon = _domain_icon(eid, key)
-            entities.append(PowerSensor(*ctx, key, name, icon))
-            entities.append(EnergySensor(*ctx, key, name, icon))
+            entities.append(PowerSensor(*ctx, key, name, icon, watched=True))
+            entities.append(EnergySensor(*ctx, key, name, icon, watched=True))
     for domain in detective.group_domains:
         target = f"group:{domain}"
         name = f"All {GROUP_DOMAINS.get(domain, domain).lower()}"
@@ -602,8 +614,10 @@ def _slug(target: str) -> str:
 
 
 class _Base(SensorEntity):
+    """Names are the appliance itself ("Dryer"), not "Load Detective Dryer"."""
+
     _attr_should_poll = False
-    _attr_has_entity_name = True
+    _attr_has_entity_name = False
 
     def __init__(self, detective: LoadDetective, entry_id: str, title: str) -> None:
         self._d = detective
@@ -617,42 +631,65 @@ class _Base(SensorEntity):
         )
 
 
-class PowerSensor(_Base):
+class _ApplianceBase(_Base):
+    """Shared naming for power/energy pairs.
+
+    Energy sensors are named for the appliance alone ("Dryer"), which is what
+    the Energy dashboard shows; power sensors add " power". For a watched
+    device the name follows that device's name in Home Assistant, so renaming
+    the TV renames its sensors too.
+    """
+
+    _suffix = ""
+
+    def __init__(self, detective, entry_id, title, target, name, icon, watched=False) -> None:
+        super().__init__(detective, entry_id, title)
+        self._target = target
+        self._watched = watched
+        self._attr_name = f"{name}{self._suffix}"
+        self._attr_icon = icon
+
+    def _refresh_name(self) -> None:
+        if not self._watched or self.hass is None:
+            return
+        name = f"{_key_name(self._target, self.hass)}{self._suffix}"
+        if name != self._attr_name:
+            self._attr_name = name
+
+
+class PowerSensor(_ApplianceBase):
     _attr_device_class = SensorDeviceClass.POWER
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = UnitOfPower.KILO_WATT
     _attr_suggested_display_precision = 2
+    _suffix = " power"
 
-    def __init__(self, detective, entry_id, title, target, name, icon) -> None:
-        super().__init__(detective, entry_id, title)
-        self._target = target
-        self._attr_name = f"{name} power"
+    def __init__(self, detective, entry_id, title, target, name, icon, watched=False) -> None:
+        super().__init__(detective, entry_id, title, target, name, icon, watched)
         self._attr_unique_id = f"{self._uid_base}_{_slug(target)}_power"
-        self._attr_icon = icon
 
     async def async_added_to_hass(self) -> None:
+        self._refresh_name()
         self._d.add_listener(self._update)
 
     @callback
     def _update(self) -> None:
+        self._refresh_name()
         val = self._d.power_for(self._target)
         self._attr_native_value = None if val is None else round(val, 3)
         self.async_write_ha_state()
 
 
-class EnergySensor(_Base, RestoreSensor):
+class EnergySensor(_ApplianceBase, RestoreSensor):
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_suggested_display_precision = 2
 
-    def __init__(self, detective, entry_id, title, target, name, icon) -> None:
-        super().__init__(detective, entry_id, title)
-        self._target = target
+    def __init__(self, detective, entry_id, title, target, name, icon, watched=False) -> None:
+        super().__init__(detective, entry_id, title, target, name, icon, watched)
         self._total = 0.0
-        self._attr_name = f"{name} energy"
         self._attr_unique_id = f"{self._uid_base}_{_slug(target)}_energy"
-        self._attr_icon = icon
         self._attr_native_value = 0.0
 
     async def async_added_to_hass(self) -> None:
@@ -663,7 +700,17 @@ class EnergySensor(_Base, RestoreSensor):
             except (TypeError, ValueError):
                 self._total = 0.0
         self._attr_native_value = round(self._total, 3)
+        self._refresh_name()
         self._d.add_energy_listener(self._add)
+        self._d.add_listener(self._maybe_rename)
+
+    @callback
+    def _maybe_rename(self) -> None:
+        """Pick up the device's name once its integration has loaded."""
+        old = self._attr_name
+        self._refresh_name()
+        if self._attr_name != old:
+            self.async_write_ha_state()
 
     @callback
     def _add(self, deltas: dict[str, float]) -> None:
@@ -672,6 +719,7 @@ class EnergySensor(_Base, RestoreSensor):
             return
         self._total += inc
         self._attr_native_value = round(self._total, 3)
+        self._refresh_name()
         self.async_write_ha_state()
 
 
@@ -682,7 +730,7 @@ class ActivitySensor(_Base):
 
     def __init__(self, detective, entry_id, title) -> None:
         super().__init__(detective, entry_id, title)
-        self._attr_name = "Activity"
+        self._attr_name = f"{title} activity"
         self._attr_unique_id = f"{self._uid_base}_activity"
 
     async def async_added_to_hass(self) -> None:
@@ -696,7 +744,7 @@ class ActivitySensor(_Base):
             if k not in (ALWAYS_ON, OTHER) and (self._d.current.get(k) or 0) > 0.05
         ]
         running += [
-            _key_name(key)
+            _key_name(key, self.hass)
             for key, kw in sorted(self._d.device_now.items())
             if kw >= 0.05
         ]
@@ -713,7 +761,7 @@ class LearnedDevicesSensor(_Base):
 
     def __init__(self, detective, entry_id, title) -> None:
         super().__init__(detective, entry_id, title)
-        self._attr_name = "Learned devices"
+        self._attr_name = f"{title} learned devices"
         self._attr_unique_id = f"{self._uid_base}_learned_devices"
 
     async def async_added_to_hass(self) -> None:

@@ -50,6 +50,14 @@ Learning restarts from history when you do.
 
 All sensors appear under one **Load Detective** device.
 
+### Sensor names
+
+Energy sensors are named for the appliance ("Dryer", "Range / cooking"), so
+that's what the Energy dashboard shows. Power sensors add "power". Watched
+devices use their own Home Assistant name, with the thermostat split into
+"heating", "cooling" and "fan". Rename the device in Home Assistant and its
+sensors follow. To override any single name, open the sensor → ⚙ → Name.
+
 ## What you get
 
 - **Pattern appliances:** a power (kW, live) and energy (kWh, running total)
