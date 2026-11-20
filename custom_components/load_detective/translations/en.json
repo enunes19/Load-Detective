@@ -1,0 +1,49 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Load Detective",
+        "description": "Pick the sensor that reports your whole home's power use (for a Powerwall, the home load / load power sensor).",
+        "data": {
+          "source": "Home power sensor",
+          "name": "Name"
+        }
+      },
+      "devices": {
+        "title": "Devices to watch",
+        "description": "Load Detective learns each device's wattage from how much your home's power jumps when it turns on or off. Lights under about 20 W usually can't be measured; give those a wattage below.",
+        "data": {
+          "devices": "Devices (each gets its own sensors)",
+          "groups": "Whole groups (one combined sensor each)",
+          "exclude": "Leave these out of the groups",
+          "watts_text": "Known wattages, one per line (for example  media_player.tv: 110)",
+          "learn_days": "Days of history to learn from at startup"
+        }
+      }
+    },
+    "error": {
+      "invalid_watts": "Each line must look like  light.porch: 9"
+    },
+    "abort": {
+      "already_configured": "Load Detective is already set up for this sensor."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Devices to watch",
+        "description": "Changes take effect right away; learning restarts from your history.",
+        "data": {
+          "devices": "Devices (each gets its own sensors)",
+          "groups": "Whole groups (one combined sensor each)",
+          "exclude": "Leave these out of the groups",
+          "watts_text": "Known wattages, one per line (for example  media_player.tv: 110)",
+          "learn_days": "Days of history to learn from at startup"
+        }
+      }
+    },
+    "error": {
+      "invalid_watts": "Each line must look like  light.porch: 9"
+    }
+  }
+}
