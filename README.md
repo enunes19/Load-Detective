@@ -22,8 +22,8 @@ It works in two layers:
 | Always on | Trailing low point of the signal (rack, fridge, standby loads) |
 | Other | Everything left over |
 
-The rules were tuned on 10 days of 30-second data from this house
-(Nov 9–19, 2026).
+The rules were tuned on 10 days of 30-second Powerwall data from one house,
+so other homes' appliances may need different thresholds.
 
 ## Install (HACS)
 
@@ -37,7 +37,7 @@ The rules were tuned on 10 days of 30-second data from this house
 
 1. **Settings → Devices & services → Add integration → Load Detective.**
 2. Pick the home power sensor. For a Powerwall that's the home load sensor
-   (here `sensor.shadblow_energy_load_power_2`).
+   (the Tesla integration names it like `sensor.<site name>_load_power`).
 3. Pick the devices to watch:
    - **Devices:** each gets its own sensors. Thermostats get three: heating,
      cooling and fan.
@@ -107,7 +107,7 @@ sensors you want. Skip **Other**: Home Assistant already shows what's left as
 ## Tuning the pattern rules
 
 The thresholds (water heater step size, dryer length, morning window and so
-on) are set in `Settings` in `classifier.py`, tuned to this house. They
+on) are set in `Settings` in `classifier.py`, tuned to the house they were built on. They
 aren't in the setup screen yet.
 
 ## Checking the rules against your own history
@@ -134,9 +134,8 @@ python3 tools/backtest.py history.csv --out labeled.csv # per-sample output
 - New entities in a group are picked up at the next restart or reconfigure.
 - The thermostat needs an `hvac_action` attribute (most do). Without it,
   heating and cooling can't be told apart and nothing is learned for it.
-- The water heater currently shows ECC (compressor not running), so only its
-  4.4 kW elements are detected. Once the compressor works, its runs of a few
-  hundred watts will mostly land in Other; a compressor rule can be added once
-  there's data with it running.
+- For a heat pump water heater, only its 4.4 kW elements are detected. Its
+  compressor runs (a few hundred watts) mostly land in Other; a compressor
+  rule needs data with the compressor running.
 - Range and toaster oven are told apart by time of day and length. A long
   midday oven bake and a dishwasher's heating cycle can both land in Range.
