@@ -43,6 +43,11 @@ class DeviceModel:
     key: str
     deltas: list[float] = field(default_factory=list)
     fixed_kw: float | None = None
+    # For loads whose draw varies while "on" (a boiler's burner cycles inside
+    # each call for heat): learn only from turn-offs, where the reading just
+    # before is a random moment of the run, and average them instead of
+    # taking the median.
+    average_off_steps: bool = False
 
     def add(self, delta: float) -> None:
         self.deltas.append(delta)
@@ -58,6 +63,16 @@ class DeviceModel:
         if not self.deltas:
             return 0.0, float("inf")
         s = sorted(self.deltas)
+        if self.average_off_steps:
+            k = len(s) // 10  # trim 10% each side
+            core = s[k: len(s) - k] or s
+            mean = sum(core) / len(core)
+            if len(core) > 1:
+                var = sum((x - mean) ** 2 for x in core) / (len(core) - 1)
+                se = (var ** 0.5) / (len(core) ** 0.5)
+            else:
+                se = float("inf")
+            return mean, se
         med = _median(s)
         mad = _median(sorted(abs(x - med) for x in s))
         se = 1.253 * 1.4826 * mad / (len(s) ** 0.5) if len(s) > 1 else float("inf")
@@ -159,6 +174,8 @@ def learn(times, values, transitions: list[Transition], models: dict[str, Device
     for tr in transitions:
         model = models.get(tr.key)
         if model is None:
+            continue
+        if model.average_off_steps and tr.turned_on:
             continue
         step = measure(times, values, t0, tr, all_ts)
         if step is not None:

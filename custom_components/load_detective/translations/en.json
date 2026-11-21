@@ -11,18 +11,24 @@
       },
       "devices": {
         "title": "Devices to watch",
-        "description": "Load Detective learns each device's wattage from how much your home's power jumps when it turns on or off. Lights under about 20 W usually can't be measured; give those a wattage below.",
+        "description": "Load Detective learns each device's wattage from how much your home's power jumps when it turns on or off. Lights under about 20 W usually can't be measured; give those a wattage below. For an oil or gas boiler with several zones, put all the zone thermostats under Boiler zones instead of Devices.",
         "data": {
           "devices": "Devices (each gets its own sensors)",
           "groups": "Whole groups (one combined sensor each)",
           "exclude": "Leave these out of the groups",
           "watts_text": "Known wattages, one per line (for example  media_player.tv: 110)",
-          "learn_days": "Days of history to learn from at startup"
+          "learn_days": "Days of history to learn from at startup",
+          "boiler_zones": "Boiler zones: thermostats that call the same boiler (counted as one appliance)",
+          "boiler_name": "Boiler name",
+          "oil_deliveries_text": "Oil deliveries, one per line (for example  2026-11-03: 142.5)",
+          "tank_gallons": "Oil tank size (0 if unknown)",
+          "oil_rate": "Oil per heating hour, if you know it (0 = learn from deliveries)"
         }
       }
     },
     "error": {
-      "invalid_watts": "Each line must look like  light.porch: 9"
+      "invalid_watts": "Each line must look like  light.porch: 9",
+      "invalid_deliveries": "Each line must look like  2026-11-03: 142.5  (date, then gallons)"
     },
     "abort": {
       "already_configured": "Load Detective is already set up for this sensor."
@@ -38,12 +44,18 @@
           "groups": "Whole groups (one combined sensor each)",
           "exclude": "Leave these out of the groups",
           "watts_text": "Known wattages, one per line (for example  media_player.tv: 110)",
-          "learn_days": "Days of history to learn from at startup"
+          "learn_days": "Days of history to learn from at startup",
+          "boiler_zones": "Boiler zones: thermostats that call the same boiler (counted as one appliance)",
+          "boiler_name": "Boiler name",
+          "oil_deliveries_text": "Oil deliveries, one per line (for example  2026-11-03: 142.5)",
+          "tank_gallons": "Oil tank size (0 if unknown)",
+          "oil_rate": "Oil per heating hour, if you know it (0 = learn from deliveries)"
         }
       }
     },
     "error": {
-      "invalid_watts": "Each line must look like  light.porch: 9"
+      "invalid_watts": "Each line must look like  light.porch: 9",
+      "invalid_deliveries": "Each line must look like  2026-11-03: 142.5  (date, then gallons)"
     }
   }
 }

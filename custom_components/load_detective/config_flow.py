@@ -9,12 +9,19 @@ from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.helpers import selector
 
+from .boiler import parse_deliveries
 from .const import (
+    CONF_BOILER_NAME,
+    CONF_BOILER_ZONES,
     CONF_DEVICES,
     CONF_EXCLUDE,
     CONF_GROUPS,
     CONF_LEARN_DAYS,
+    CONF_OIL_DELIVERIES,
+    CONF_OIL_RATE,
     CONF_SOURCE,
+    CONF_TANK_GALLONS,
+    DEFAULT_BOILER_NAME,
     CONF_WATTS,
     DEFAULT_LEARN_DAYS,
     DEFAULT_NAME,
@@ -25,6 +32,7 @@ from .const import (
 
 CONF_NAME = "name"
 CONF_WATTS_TEXT = "watts_text"
+CONF_DELIVERIES_TEXT = "oil_deliveries_text"
 
 
 def _watts_to_text(watts: dict[str, float]) -> str:
@@ -40,10 +48,14 @@ def _text_to_watts(text: str) -> dict[str, float]:
             continue
         key, sep, val = line.rpartition(":")
         key = key.strip()
-        if not sep or "." not in key:
+        if not sep or ("." not in key and key != "boiler"):
             raise ValueError(line)
         out[key] = float(val.strip())
     return out
+
+
+def _deliveries_to_text(deliveries) -> str:
+    return "\n".join(f"{d}: {float(g):g}" for d, g in sorted(deliveries))
 
 
 def _devices_schema(defaults: dict[str, Any]) -> vol.Schema:
@@ -81,13 +93,55 @@ def _devices_schema(defaults: dict[str, Any]) -> vol.Schema:
                     min=0, max=30, step=1, mode=selector.NumberSelectorMode.BOX
                 )
             ),
+            vol.Optional(
+                CONF_BOILER_ZONES, default=defaults.get(CONF_BOILER_ZONES, [])
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="climate", multiple=True)
+            ),
+            vol.Optional(
+                CONF_BOILER_NAME,
+                default=defaults.get(CONF_BOILER_NAME, DEFAULT_BOILER_NAME),
+            ): selector.TextSelector(),
+            vol.Optional(
+                CONF_DELIVERIES_TEXT,
+                default=_deliveries_to_text(defaults.get(CONF_OIL_DELIVERIES, [])),
+            ): selector.TextSelector(selector.TextSelectorConfig(multiline=True)),
+            vol.Optional(
+                CONF_TANK_GALLONS, default=defaults.get(CONF_TANK_GALLONS, 0)
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0, max=2000, step=1, unit_of_measurement="gal",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_OIL_RATE, default=defaults.get(CONF_OIL_RATE, 0)
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0, max=5, step=0.01, unit_of_measurement="gal/h",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
         }
     )
 
 
+class BadDeliveries(ValueError):
+    pass
+
+
 def _clean_devices(user_input: dict[str, Any]) -> dict[str, Any]:
-    """Turn form input into stored options. Raises ValueError on bad watts."""
+    """Turn form input into stored options. Raises ValueError on bad input."""
+    try:
+        deliveries = parse_deliveries(user_input.get(CONF_DELIVERIES_TEXT, ""))
+    except ValueError as err:
+        raise BadDeliveries(str(err)) from err
     return {
+        CONF_BOILER_ZONES: list(user_input.get(CONF_BOILER_ZONES, [])),
+        CONF_BOILER_NAME: (user_input.get(CONF_BOILER_NAME) or DEFAULT_BOILER_NAME).strip(),
+        CONF_OIL_DELIVERIES: [[d.isoformat(), g] for d, g in deliveries],
+        CONF_TANK_GALLONS: float(user_input.get(CONF_TANK_GALLONS) or 0),
+        CONF_OIL_RATE: float(user_input.get(CONF_OIL_RATE) or 0),
         CONF_DEVICES: list(user_input.get(CONF_DEVICES, [])),
         CONF_GROUPS: list(user_input.get(CONF_GROUPS, [])),
         CONF_EXCLUDE: list(user_input.get(CONF_EXCLUDE, [])),
@@ -127,6 +181,8 @@ class LoadDetectiveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             try:
                 options = _clean_devices(user_input)
+            except BadDeliveries:
+                errors[CONF_DELIVERIES_TEXT] = "invalid_deliveries"
             except ValueError:
                 errors[CONF_WATTS_TEXT] = "invalid_watts"
             else:
@@ -153,6 +209,8 @@ class LoadDetectiveOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             try:
                 options = _clean_devices(user_input)
+            except BadDeliveries:
+                errors[CONF_DELIVERIES_TEXT] = "invalid_deliveries"
             except ValueError:
                 errors[CONF_WATTS_TEXT] = "invalid_watts"
             else:

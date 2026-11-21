@@ -81,7 +81,50 @@ sensors follow. To override any single name, open the sensor → ⚙ → Name.
 A device only gets credited once it's learned or fixed. Until then its usage
 stays in the pattern layer or Other.
 
-### Known wattages
+### Boiler and oil
+
+For an oil (or gas) boiler with several heating zones, put all the zone
+thermostats under **Boiler zones** in the setup screen, not under Devices.
+The boiler then counts as one appliance that runs whenever any zone calls
+for heat. A thermostat listed in both places is only counted in the boiler.
+
+You get:
+
+| Sensor | What it is |
+|---|---|
+| Boiler / Boiler power | Electricity for the burner motor and circulators |
+| Boiler heating hours | Running total of hours any zone called for heat |
+| Boiler oil used | Running total of gallons burned (estimate) |
+| Boiler oil energy | The same oil in kWh (1 gal ≈ 40.6 kWh), for the Energy dashboard's Gas slot |
+| Boiler oil since last delivery | Gallons burned since your last fill-up |
+| Boiler oil remaining | Tank size minus that (only if you enter a tank size) |
+| Boiler oil per heating hour | The rate behind the estimate, with how it was worked out |
+
+**How the oil estimate works.** Oil burned = heating hours × gallons per
+heating hour. Enter your deliveries in the setup screen, one per line:
+
+```
+2026-10-14: 151.2
+2026-11-19: 138.7
+```
+
+A fill-up's gallons are what was burned since the previous fill-up. Once two
+deliveries bracket a stretch where heating hours were tracked (at least half
+of it), the rate is worked out from them. Each new delivery you add refines
+it. Until then, the oil sensors stay empty, unless you enter a rate yourself
+(for example nozzle size × about 0.5–0.7 for the share of each call the
+burner actually fires).
+
+Heating hours are saved, survive restarts, and gaps while Home Assistant was
+off are filled in from history. Each thermostat must report `hvac_action`
+(heating / idle).
+
+**Electricity.** The burner cycles on and off inside each call for heat, so
+the boiler's wattage is learned from how much the load drops when the last
+zone stops calling, averaged over many calls. That gives the average draw
+over a call rather than the peak.
+
+
 
 For anything slow to learn (a TV used once a day) or too small to measure
 (individual bulbs), enter it in the setup screen's wattage box, one per line:

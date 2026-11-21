@@ -30,3 +30,12 @@ GROUP_DOMAINS = {
     "fan": "Fans",
     "media_player": "Media players",
 }
+
+# Boiler / oil
+CONF_BOILER_ZONES = "boiler_zones"
+CONF_BOILER_NAME = "boiler_name"
+CONF_OIL_DELIVERIES = "oil_deliveries"  # list of [iso date, gallons]
+CONF_OIL_RATE = "oil_rate"  # gallons per heating hour; 0 = learn from deliveries
+CONF_TANK_GALLONS = "tank_gallons"  # 0 = unknown
+
+DEFAULT_BOILER_NAME = "Boiler"

@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import partial
 
 from homeassistant.components.recorder import get_instance, history
@@ -29,8 +29,11 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
+    EntityCategory,
     UnitOfEnergy,
     UnitOfPower,
+    UnitOfTime,
+    UnitOfVolume,
 )
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
@@ -45,6 +48,7 @@ from homeassistant.helpers.event import (
     async_track_time_interval,
 )
 from homeassistant.helpers.start import async_at_started
+from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .classifier import (
@@ -57,8 +61,22 @@ from .classifier import (
     classify,
     resample,
 )
+from .boiler import (
+    BOILER_ID,
+    KWH_PER_GALLON,
+    add_hours,
+    calibrate,
+    merge_zones,
+    since_last_delivery,
+)
 from .const import (
+    CONF_BOILER_NAME,
+    CONF_BOILER_ZONES,
     CONF_DEVICES,
+    CONF_OIL_DELIVERIES,
+    CONF_OIL_RATE,
+    CONF_TANK_GALLONS,
+    DEFAULT_BOILER_NAME,
     CONF_EXCLUDE,
     CONF_GROUPS,
     CONF_LEARN_DAYS,
@@ -217,7 +235,7 @@ def _learn_job(samples, entity_changes, models, slow_entities):
     return learn(times, values, transitions, models)
 
 
-def _run_job(samples, now_ts, settings, intervals, kw_by_key, ready, all_ts):
+def _run_job(samples, now_ts, settings, intervals, kw_by_key, ready, all_ts, boiler_ivs):
     """Executor: build the grid, credit known devices, classify, measure switches."""
     times, values = resample(samples, now_ts - BUFFER_S, now_ts)
     hours = [
@@ -251,7 +269,8 @@ def _run_job(samples, now_ts, settings, intervals, kw_by_key, ready, all_ts):
         sorted_ts = sorted(all_ts)
         for tr in ready:
             steps.append((tr.key, measure(times, values, times[0], tr, sorted_ts)))
-    return times, values, out, events, dev_power, steps
+    boiler_on = on_series(times, boiler_ivs) if boiler_ivs is not None else None
+    return times, values, out, events, dev_power, steps, boiler_on
 
 
 # --------------------------------------------------------------------------
@@ -261,11 +280,26 @@ def _run_job(samples, now_ts, settings, intervals, kw_by_key, ready, all_ts):
 class LoadDetective:
     """Keeps buffers, learns devices, runs the classifier, feeds the entities."""
 
-    def __init__(self, hass: HomeAssistant, config) -> None:
+    def __init__(self, hass: HomeAssistant, config, entry_id: str = "default") -> None:
         self.hass = hass
         self.source: str = config[CONF_SOURCE]
         self.settings = Settings()
-        self.devices: list[str] = list(config.get(CONF_DEVICES, []))
+        # Boiler: several zone thermostats counted as one appliance.
+        self.zones: list[str] = list(config.get(CONF_BOILER_ZONES, []))
+        self.boiler_name: str = config.get(CONF_BOILER_NAME) or DEFAULT_BOILER_NAME
+        self.deliveries = sorted(
+            (date.fromisoformat(d), float(g)) for d, g in config.get(CONF_OIL_DELIVERIES, [])
+        )
+        self.manual_rate: float = float(config.get(CONF_OIL_RATE) or 0)
+        self.tank_gallons: float = float(config.get(CONF_TANK_GALLONS) or 0)
+        self.zone_modes: dict[str, str | None] = {}
+        self._store = Store(hass, 1, f"load_detective.{entry_id}")
+        self.heat: dict = {"daily": {}, "since": None, "tracked_until": None}
+        self.oil: dict = {}
+        # a zone in the boiler isn't also watched on its own (no double counting)
+        self.devices: list[str] = [
+            d for d in config.get(CONF_DEVICES, []) if d not in set(self.zones)
+        ]
         self.group_domains: list[str] = [d.strip().lower() for d in config.get(CONF_GROUPS, [])]
         self.exclude: set[str] = set(config.get(CONF_EXCLUDE, []))
         self.watts: dict[str, float] = dict(config.get(CONF_WATTS, {}))
@@ -288,6 +322,20 @@ class LoadDetective:
         self._unsubs: list = []
         for eid in self.devices:
             self._add_entity(eid)
+        if self.zones:
+            self._add_entity(BOILER_ID)
+            self.models[BOILER_ID].average_off_steps = True
+            if "boiler" in self.watts:
+                self.models[BOILER_ID].fixed_kw = self.watts["boiler"] / 1000
+
+    @property
+    def has_boiler(self) -> bool:
+        return bool(self.zones)
+
+    def display_name(self, key: str) -> str:
+        if key == BOILER_ID:
+            return self.boiler_name
+        return _key_name(key, self.hass)
 
     # -- setup ------------------------------------------------------------
 
@@ -306,7 +354,12 @@ class LoadDetective:
 
     @property
     def watched(self) -> list[str]:
-        return list(self.changes)
+        """Real entities watched one by one (not the combined boiler)."""
+        return [e for e in self.changes if e != BOILER_ID]
+
+    @property
+    def subscribed(self) -> list[str]:
+        return self.watched + self.zones
 
     def add_listener(self, cb) -> None:
         self._listeners.append(cb)
@@ -328,16 +381,20 @@ class LoadDetective:
             for eid in members:
                 self._add_entity(eid)
 
+        stored = await self._store.async_load()
+        if isinstance(stored, dict) and isinstance(stored.get("daily"), dict):
+            self.heat.update(stored)
         await self._async_backfill()
         if self.stopped:  # unloaded while history was loading
             return
+        self._update_oil()
 
         self._unsubs.append(
             async_track_state_change_event(self.hass, [self.source], self._handle_source)
         )
-        if self.watched:
+        if self.subscribed:
             self._unsubs.append(
-                async_track_state_change_event(self.hass, self.watched, self._handle_device)
+                async_track_state_change_event(self.hass, self.subscribed, self._handle_device)
             )
         self._unsubs.append(
             async_track_time_interval(self.hass, self._handle_interval, UPDATE_INTERVAL)
@@ -379,7 +436,7 @@ class LoadDetective:
         samples.sort()
 
         dev_states = {}
-        if self.watched:
+        if self.subscribed:
             try:
                 dev_states = await recorder.async_add_executor_job(
                     partial(
@@ -387,7 +444,7 @@ class LoadDetective:
                         self.hass,
                         start,
                         end,
-                        entity_ids=self.watched,
+                        entity_ids=self.subscribed,
                         include_start_time_state=True,
                         significant_changes_only=False,
                         minimal_response=False,
@@ -408,9 +465,25 @@ class LoadDetective:
             entity_changes[eid] = changes
             self.changes[eid].extend(changes)
 
-        if self.learn_days and samples and self.watched:
+        if self.zones:
+            zone_changes = {}
+            for eid in self.zones:
+                changes = _changes_from_states(eid, dev_states.get(eid.lower(), []))
+                if not changes:
+                    mode = device_mode(eid, self.hass.states.get(eid))
+                    if mode is not IGNORE:
+                        changes = [(time.time(), mode)]
+                zone_changes[eid] = changes
+                if changes:
+                    self.zone_modes[eid] = changes[-1][1]
+            boiler_changes = merge_zones(zone_changes)
+            entity_changes[BOILER_ID] = boiler_changes
+            self.changes[BOILER_ID].extend(boiler_changes)
+            self._backfill_hours(boiler_changes, start.timestamp(), end.timestamp())
+
+        if self.learn_days and samples and entity_changes:
             learn_samples = [s for s in samples if s[0] >= learn_start.timestamp()]
-            slow = {e for e in self.watched if e.startswith("climate.")}
+            slow = {e for e in entity_changes if e.startswith("climate.") or e == BOILER_ID}
             added = await self.hass.async_add_executor_job(
                 _learn_job, learn_samples, entity_changes, self.models, slow
             )
@@ -418,6 +491,53 @@ class LoadDetective:
 
         cutoff = buf_start.timestamp() - 900
         self.samples.extend(s for s in samples if s[0] >= cutoff)
+
+    def _backfill_hours(self, boiler_changes, hist_start: float, now_ts: float) -> None:
+        """Fill heating hours the live loop didn't see (first install, restarts)."""
+        end = (int(now_ts // STEP_S) * STEP_S) - SETTLE_SAMPLES * STEP_S
+        start = self.heat.get("tracked_until") or hist_start
+        start = max(start, hist_start)
+        if self.heat.get("since") is None:
+            self.heat["since"] = hist_start
+        if end > start:
+            ivs = _intervals_from(BOILER_ID, boiler_changes, start).get(BOILER_ID, [])
+            add_hours(self.heat["daily"], ivs, start, end, dt_util.DEFAULT_TIME_ZONE)
+        self.heat["tracked_until"] = max(end, self.heat.get("tracked_until") or 0)
+        self._settled_ts = end
+        self._save()
+
+    def _save(self) -> None:
+        self._store.async_delay_save(lambda: self.heat, 60)
+
+    def _update_oil(self) -> None:
+        """Recompute the oil rate and the since-delivery figures."""
+        if not self.has_boiler:
+            return
+        tz = dt_util.DEFAULT_TIME_ZONE
+        since_ts = self.heat.get("since") or time.time()
+        since = datetime.fromtimestamp(since_ts, tz).date()
+        today = dt_util.now().date()
+        cal_rate, periods = calibrate(self.deliveries, self.heat["daily"], since_ts, tz)
+        rate = self.manual_rate or cal_rate
+        hours_since, estimated, last = since_last_delivery(
+            self.deliveries, self.heat["daily"], since_ts, tz, today
+        )
+        used_since = rate * hours_since if (rate and hours_since is not None) else None
+        remaining = None
+        if used_since is not None and self.tank_gallons:
+            remaining = max(self.tank_gallons - used_since, 0.0)
+        self.oil = {
+            "rate": rate,
+            "source": "entered" if self.manual_rate else ("deliveries" if cal_rate else None),
+            "calibrated_rate": cal_rate,
+            "periods": periods,
+            "last_delivery": last.isoformat() if last else None,
+            "hours_since_delivery": hours_since,
+            "used_since_delivery": used_since,
+            "remaining": remaining,
+            "estimated": estimated,
+            "tracking_since": since.isoformat(),
+        }
 
     # -- live updates -----------------------------------------------------
 
@@ -436,7 +556,9 @@ class LoadDetective:
     def _handle_device(self, event: Event) -> None:
         eid = event.data.get("entity_id")
         state = event.data.get("new_state")
-        if eid not in self.changes:
+        if eid in self.zones:
+            self._handle_zone(eid, state)
+        if eid not in self.changes or eid == BOILER_ID:
             return
         mode = device_mode(eid, state)
         if mode is IGNORE:
@@ -450,6 +572,21 @@ class LoadDetective:
         if len(changes) > 1:
             slow = eid.startswith("climate.")
             self.pending.extend(_transitions_from(eid, [(0, prev), (ts, mode)], slow))
+
+    def _handle_zone(self, eid: str, state) -> None:
+        mode = device_mode(eid, state)
+        if mode is IGNORE:
+            return
+        self.zone_modes[eid] = mode
+        new = "on" if any(m == "heating" for m in self.zone_modes.values()) else None
+        changes = self.changes[BOILER_ID]
+        prev = changes[-1][1] if changes else None
+        if changes and new == prev:
+            return
+        ts = state.last_updated.timestamp()
+        changes.append((ts, new))
+        if len(changes) > 1:
+            self.pending.extend(_transitions_from(BOILER_ID, [(0, prev), (ts, new)], True))
 
     async def _handle_interval(self, _now) -> None:
         await self.async_refresh()
@@ -489,14 +626,21 @@ class LoadDetective:
             intervals.update(_intervals_from(eid, list(changes), buf_start))
             all_ts.extend(ts for ts, _ in changes)
         kw_by_key = {k: m.kw for k, m in self.models.items()}
-        ready = [t for t in self.pending if t.ts + MEASURE_AFTER_S <= now_ts]
+        boiler_ivs = intervals.get(BOILER_ID, []) if self.has_boiler else None
+        ready = [
+            t for t in self.pending
+            if t.ts + MEASURE_AFTER_S <= now_ts
+            and not (t.key in self.models and self.models[t.key].average_off_steps and t.turned_on)
+        ]
         self.pending = [t for t in self.pending if t.ts + MEASURE_AFTER_S > now_ts]
 
         self._running = True
         try:
-            times, values, out, events, dev_power, steps = await self.hass.async_add_executor_job(
+            (
+                times, values, out, events, dev_power, steps, boiler_on,
+            ) = await self.hass.async_add_executor_job(
                 _run_job, list(self.samples), now_ts, self.settings,
-                intervals, kw_by_key, ready, all_ts,
+                intervals, kw_by_key, ready, all_ts, boiler_ivs,
             )
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Load Detective classification failed")
@@ -554,6 +698,25 @@ class LoadDetective:
                     deltas[f"group:{domain}"] = sum(
                         deltas.get(key, 0.0) for eid in members for key in device_keys(eid)
                     )
+                if boiler_on is not None:
+                    hours = 0.0
+                    daily = self.heat["daily"]
+                    for i in range(settle_idx + 1):
+                        if times[i] <= self._settled_ts or not boiler_on[i]:
+                            continue
+                        day = dt_util.as_local(
+                            datetime.fromtimestamp(times[i], tz=timezone.utc)
+                        ).date().isoformat()
+                        daily[day] = daily.get(day, 0.0) + STEP_S / 3600
+                        hours += STEP_S / 3600
+                    self.heat["tracked_until"] = settle_ts
+                    self._save()
+                    self._update_oil()
+                    rate = self.oil.get("rate")
+                    deltas["boiler:hours"] = hours
+                    if rate:
+                        deltas["boiler:oil"] = hours * rate
+                        deltas["boiler:oil_kwh"] = hours * rate * KWH_PER_GALLON
                 self._settled_ts = settle_ts
                 for cb in self._energy_listeners:
                     cb(deltas)
@@ -582,7 +745,7 @@ class LoadDetective:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities) -> None:
     config = {**entry.data, **entry.options}
-    detective = LoadDetective(hass, config)
+    detective = LoadDetective(hass, config, entry.entry_id)
     title = entry.title or DEFAULT_NAME
     ctx = (detective, entry.entry_id, title)
 
@@ -603,6 +766,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         icon = _DOMAIN_ICONS.get(domain, "mdi:devices")
         entities.append(PowerSensor(*ctx, target, name, icon))
         entities.append(EnergySensor(*ctx, target, name, icon))
+    if detective.has_boiler:
+        bname = detective.boiler_name
+        entities.append(PowerSensor(*ctx, BOILER_ID, bname, "mdi:water-boiler"))
+        entities.append(EnergySensor(*ctx, BOILER_ID, bname, "mdi:water-boiler"))
+        entities += [
+            TotalSensor(*ctx, "boiler:hours", f"{bname} heating hours", "mdi:timer-outline",
+                        UnitOfTime.HOURS, SensorDeviceClass.DURATION),
+            TotalSensor(*ctx, "boiler:oil", f"{bname} oil used", "mdi:oil",
+                        UnitOfVolume.GALLONS, SensorDeviceClass.VOLUME),
+            TotalSensor(*ctx, "boiler:oil_kwh", f"{bname} oil energy", "mdi:fire",
+                        UnitOfEnergy.KILO_WATT_HOUR, SensorDeviceClass.ENERGY),
+            OilSensor(*ctx, "used_since_delivery", f"{bname} oil since last delivery"),
+            OilSensor(*ctx, "rate", f"{bname} oil per heating hour"),
+        ]
+        if detective.tank_gallons:
+            entities.append(OilSensor(*ctx, "remaining", f"{bname} oil remaining"))
     async_add_entities(entities)
 
     entry.async_on_unload(detective.async_stop)
@@ -744,7 +923,7 @@ class ActivitySensor(_Base):
             if k not in (ALWAYS_ON, OTHER) and (self._d.current.get(k) or 0) > 0.05
         ]
         running += [
-            _key_name(key, self.hass)
+            self._d.display_name(key)
             for key, kw in sorted(self._d.device_now.items())
             if kw >= 0.05
         ]
@@ -809,3 +988,97 @@ def _domain_icon(eid: str, key: str) -> str:
     if key.endswith("|fan"):
         return "mdi:fan"
     return _DOMAIN_ICONS.get(eid.split(".", 1)[0], "mdi:power-plug")
+
+
+class TotalSensor(_Base, RestoreSensor):
+    """A running total (heating hours, gallons) that survives restarts."""
+
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_suggested_display_precision = 1
+
+    def __init__(self, detective, entry_id, title, target, name, icon, unit, device_class) -> None:
+        super().__init__(detective, entry_id, title)
+        self._target = target
+        self._total = 0.0
+        self._attr_name = name
+        self._attr_icon = icon
+        self._attr_native_unit_of_measurement = unit
+        self._attr_device_class = device_class
+        self._attr_unique_id = f"{self._uid_base}_{_slug(target)}"
+        self._attr_native_value = 0.0
+
+    async def async_added_to_hass(self) -> None:
+        last = await self.async_get_last_sensor_data()
+        if last is not None and last.native_value is not None:
+            try:
+                self._total = float(last.native_value)
+            except (TypeError, ValueError):
+                self._total = 0.0
+        self._attr_native_value = round(self._total, 3)
+        self._d.add_energy_listener(self._add)
+
+    @callback
+    def _add(self, deltas: dict[str, float]) -> None:
+        inc = deltas.get(self._target, 0.0)
+        if inc <= 0:
+            return
+        self._total += inc
+        self._attr_native_value = round(self._total, 3)
+        self.async_write_ha_state()
+
+
+class OilSensor(_Base):
+    """Oil figures that go up and down: since last delivery, remaining, rate."""
+
+    def __init__(self, detective, entry_id, title, field, name) -> None:
+        super().__init__(detective, entry_id, title)
+        self._field = field
+        self._attr_name = name
+        self._attr_unique_id = f"{self._uid_base}_boiler_oil_{field}"
+        if field == "rate":
+            self._attr_native_unit_of_measurement = "gal/h"
+            self._attr_icon = "mdi:speedometer"
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
+            self._attr_suggested_display_precision = 2
+        elif field == "remaining":
+            self._attr_native_unit_of_measurement = UnitOfVolume.GALLONS
+            self._attr_device_class = SensorDeviceClass.VOLUME_STORAGE
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+            self._attr_icon = "mdi:storage-tank-outline"
+            self._attr_suggested_display_precision = 0
+        else:
+            self._attr_native_unit_of_measurement = UnitOfVolume.GALLONS
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+            self._attr_icon = "mdi:oil"
+            self._attr_suggested_display_precision = 1
+
+    async def async_added_to_hass(self) -> None:
+        self._d.add_listener(self._update)
+
+    @callback
+    def _update(self) -> None:
+        oil = self._d.oil
+        val = oil.get(self._field)
+        self._attr_native_value = None if val is None else round(val, 3)
+        attrs = {
+            "last_delivery": oil.get("last_delivery"),
+            "tracking_since": oil.get("tracking_since"),
+        }
+        if self._field == "rate":
+            attrs.update(
+                source=oil.get("source"),
+                learned_from_deliveries=(
+                    round(oil["calibrated_rate"], 3) if oil.get("calibrated_rate") else None
+                ),
+                delivery_periods=oil.get("periods"),
+            )
+        else:
+            attrs.update(
+                heating_hours_since_delivery=(
+                    round(oil["hours_since_delivery"], 1)
+                    if oil.get("hours_since_delivery") is not None else None
+                ),
+                estimated_from_partial_data=oil.get("estimated"),
+            )
+        self._attr_extra_state_attributes = attrs
+        self.async_write_ha_state()
